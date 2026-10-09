@@ -1,0 +1,1616 @@
+<!-- VibeCodingArt | Category: Interactive Toys | Prompt: "Bubbles that grow where I touch and burst when they meet" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VibeCodingArt</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  overflow: hidden; background: #7fb0dc; height: 100%; touch-action: none; cursor: none;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+canvas {
+  display: block; width: 100%; height: 100%; background: #7fb0dc; touch-action: none;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-user-drag: none;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const c = document.getElementById('c');
+const ctx = c.getContext('2d');
+
+let w = 0, h = 0, dpr = 1;
+const SKY_HUE = 206 + Math.random() * 6;
+const sizeMood = 0.85 + Math.random() * 0.3;
+const driftMood = (Math.random() - 0.5) * 0.3;
+const MIN_R = 40;
+const VARIANTS = 8;
+const FILL = 0.94;
+const CLOUD_SEED = (Math.random() * 1e6) | 0;
+
+const bubbles = [];
+const droplets = [];
+const flashes = [];
+const dust = [];
+const pointers = new Map();
+
+function hash2(ix, iy, s) {
+  let n = Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(s, 982451653);
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+
+function vnoise(x, y, period, s) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const x0 = ((ix % period) + period) % period;
+  const x1 = (x0 + 1) % period;
+  const a = hash2(x0, iy, s), b = hash2(x1, iy, s);
+  const c2 = hash2(x0, iy + 1, s), d = hash2(x1, iy + 1, s);
+  return a + (b - a) * ux + (c2 - a) * uy + (a - b - c2 + d) * ux * uy;
+}
+
+function fbm(x, y, period, s, oct) {
+  let v = 0, amp = 0.5, f = 1, norm = 0;
+  for (let o = 0; o < oct; o++) {
+    v += amp * vnoise(x * f, y * f, period * f, s + o * 17);
+    norm += amp;
+    amp *= 0.5;
+    f *= 2;
+  }
+  return v / norm;
+}
+
+function smooth(a, b, x) {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+const lerp = (a, b, t) => a + (b - a) * t;
+const mix3 = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+
+const SKY_TOP = [46, 104, 186];
+const SKY_MID = [104, 162, 222];
+const SKY_LOW = [210, 230, 238];
+const HILL = [98, 146, 156];
+const MEADOW_D = [42, 94, 58];
+const MEADOW = [88, 150, 70];
+const MEADOW_L = [170, 198, 92];
+const CLOUD_SHADOW = [146, 162, 206];
+const CLOUD_MID = [214, 222, 238];
+const CLOUD_LIT = [255, 251, 240];
+const CLOUD_WARM = [255, 230, 198];
+const FLOWERS = [[250, 246, 234], [250, 214, 96], [240, 168, 188], [196, 178, 236]];
+
+let painting = null, cloudNear = null, cloudFar = null, grain = null;
+let paintTimer = 0;
+let platePx = null, plateW = 0, plateH = 0;
+
+function ridgeY(u, s, base, amp) {
+  return base + amp * (fbm(u * 4, 0.5, 4, s, 3) - 0.5) * 2;
+}
+
+function landColor(u, v, s) {
+  const far = ridgeY(u, s + 3, 0.7, 0.035);
+  const near = ridgeY(u + 0.37, s + 9, 0.8, 0.045);
+  if (v < far) {
+    const t = v / far;
+    return t < 0.55 ? mix3(SKY_TOP, SKY_MID, t / 0.55) : mix3(SKY_MID, SKY_LOW, (t - 0.55) / 0.45);
+  }
+  if (v < near) {
+    return mix3(mix3(HILL, SKY_LOW, 0.28), mix3(HILL, MEADOW_D, 0.45), smooth(far, near, v));
+  }
+  const g = fbm(u * 12, v * 9, 12, s + 21, 3);
+  const depth = smooth(near, 1, v);
+  let col = mix3(MEADOW, MEADOW_L, smooth(0.42, 0.72, g) * (1 - depth * 0.6));
+  return mix3(col, MEADOW_D, depth * 0.55 * (1 - g));
+}
+
+function zone(v, u, s) {
+  if (v < ridgeY(u, s + 3, 0.7, 0.035)) return 0;
+  if (v < ridgeY(u + 0.37, s + 9, 0.8, 0.045)) return 1;
+  return 2;
+}
+
+function dab(g, x, y, len, thick, rot, col, alpha) {
+  const cs = Math.cos(rot), sn = Math.sin(rot);
+  g.setTransform(cs, sn, -sn, cs, x, y);
+  g.globalAlpha = alpha;
+  g.fillStyle = `rgb(${col[0] | 0},${col[1] | 0},${col[2] | 0})`;
+  g.beginPath();
+  g.ellipse(0, 0, len, thick, 0, 0, Math.PI * 2);
+  g.fill();
+}
+
+function jitter(col, rnd, amt) {
+  const k = (rnd() - 0.5) * amt;
+  return [col[0] + k + (rnd() - 0.5) * amt * 0.5, col[1] + k + (rnd() - 0.5) * amt * 0.5, col[2] + k + (rnd() - 0.5) * amt * 0.5];
+}
+
+function makeLand(seed, cw, ch) {
+  const cv = document.createElement('canvas');
+  cv.width = cw;
+  cv.height = ch;
+  const g = cv.getContext('2d');
+  const gw = Math.max(32, Math.ceil(cw / 4)), gh = Math.max(32, Math.ceil(ch / 4));
+  const under = document.createElement('canvas');
+  under.width = gw;
+  under.height = gh;
+  const ug = under.getContext('2d');
+  const img = ug.createImageData(gw, gh);
+  for (let j = 0; j < gh; j++) {
+    for (let i = 0; i < gw; i++) {
+      const col = landColor(i / gw, (j + 0.5) / gh, seed);
+      const o = (j * gw + i) * 4;
+      img.data[o] = col[0]; img.data[o + 1] = col[1]; img.data[o + 2] = col[2]; img.data[o + 3] = 255;
+    }
+  }
+  ug.putImageData(img, 0, 0);
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(under, 0, 0, cw, ch);
+
+  const rnd = seeded(seed + 77);
+  const count = Math.floor(cw * ch / 13);
+  for (let n = 0; n < count; n++) {
+    const x = rnd() * cw, y = rnd() * ch;
+    const u = x / cw, v = y / ch;
+    const z = zone(v, u, seed);
+    let col = landColor(u, v, seed);
+    let len, thick, rot;
+    if (z === 0) {
+      len = 4 + rnd() * 7; thick = len * (0.32 + rnd() * 0.2); rot = -0.18 + (rnd() - 0.5) * 0.7;
+      if (rnd() < 0.06) col = mix3(col, rnd() < 0.5 ? [236, 214, 236] : [226, 240, 236], 0.4);
+    } else if (z === 1) {
+      len = 3 + rnd() * 4; thick = len * (0.4 + rnd() * 0.2); rot = (rnd() - 0.5) * 0.5;
+    } else {
+      len = 2 + rnd() * 4; thick = len * (0.36 + rnd() * 0.2); rot = -Math.PI / 2 + (rnd() - 0.5) * 0.9;
+      if (rnd() < 0.08) col = mix3(col, [230, 214, 110], 0.35);
+      if (rnd() < 0.05) col = mix3(col, [70, 90, 140], 0.25);
+    }
+    dab(g, x, y, len, thick, rot, jitter(col, rnd, 22), 0.85);
+    if (rnd() < 0.22) dab(g, x - len * 0.2, y - thick * 0.4, len * 0.5, thick * 0.3, rot, mix3(col, [255, 248, 226], 0.45), 0.6);
+  }
+
+  for (let n = 0; n < count * 0.011; n++) {
+    const x = rnd() * cw, y = ch * (0.82 + rnd() * 0.18);
+    if (zone(y / ch, x / cw, seed) !== 2) continue;
+    const f = FLOWERS[(rnd() * FLOWERS.length) | 0];
+    const r = 1.2 + rnd() * 2.2;
+    dab(g, x, y, r, r * 0.8, rnd() * 3, f, 0.9);
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1;
+  return cv;
+}
+
+function cloudBlobs(rnd, A, far) {
+  const blobs = [];
+  const masses = far ? Math.max(3, Math.round(A * 2.6)) : Math.max(2, Math.round(A * 1.5));
+  for (let m = 0; m < masses; m++) {
+    const mx = (m + 0.15 + rnd() * 0.7) / masses * A;
+    const y0 = far ? 0.6 + rnd() * 0.07 : 0.4 + rnd() * 0.17;
+    const W = far ? 0.09 + rnd() * 0.1 : 0.2 + rnd() * 0.2;
+    const H = far ? 0.05 + rnd() * 0.04 : 0.16 + rnd() * 0.14;
+    const n = far ? 5 + (rnd() * 4 | 0) : 10 + (rnd() * 8 | 0);
+    for (let k = 0; k < n; k++) {
+      const dx = (rnd() - 0.5) * 2;
+      const r = (far ? 0.022 + rnd() * 0.025 : 0.05 + rnd() * 0.075) * (1 - Math.abs(dx) * 0.45);
+      blobs.push({
+        x: mx + dx * W * 0.5,
+        y: y0 - r * 0.55 - rnd() * H * (1 - Math.abs(dx) * 0.7),
+        r, y0, H
+      });
+    }
+  }
+  return blobs;
+}
+
+function makeClouds(seed, cw, ch, far) {
+  const A = cw / ch;
+  const rnd = seeded(seed);
+  const blobs = cloudBlobs(rnd, A, far);
+  const gw = Math.max(32, Math.ceil(cw / 3)), gh = Math.max(32, Math.ceil(ch / 3));
+  const P = Math.max(2, Math.round(A * 6));
+  const dens = new Float32Array(gw * gh);
+  const cols = new Float32Array(gw * gh * 3);
+  for (let j = 0; j < gh; j++) {
+    const y = (j + 0.5) / gh;
+    for (let i = 0; i < gw; i++) {
+      const x = (i + 0.5) / gw * A;
+      let best = 0, bb = null, bdx = 0;
+      for (const b of blobs) {
+        let dx = x - b.x;
+        dx -= A * Math.round(dx / A);
+        const dy = y - b.y;
+        if (Math.abs(dy) > b.r || Math.abs(dx) > b.r) continue;
+        const val = 1 - Math.sqrt(dx * dx + dy * dy) / b.r;
+        if (val > best) { best = val; bb = b; bdx = dx; }
+      }
+      if (!bb) continue;
+      const nz = fbm(x / A * P, y * 6, P, seed + 5, 3);
+      const d = smooth(0, 0.3, best + (nz - 0.5) * 0.32) * smooth(bb.y0 + 0.015, bb.y0 - 0.02, y);
+      if (d <= 0.01) continue;
+      const ny = (y - bb.y) / bb.r, nx = bdx / bb.r;
+      let lit = clamp01(0.6 - ny * 0.7 + nx * 0.22 + (nz - 0.5) * 0.45);
+      lit *= 1 - 0.72 * smooth(bb.y0 - bb.H * 0.6, bb.y0, y);
+      let col = lit < 0.5 ? mix3(CLOUD_SHADOW, CLOUD_MID, lit * 2) : mix3(CLOUD_MID, CLOUD_LIT, (lit - 0.5) * 2);
+      if (lit > 0.78) col = mix3(col, CLOUD_WARM, (lit - 0.78) * 1.4);
+      const k = j * gw + i;
+      dens[k] = d;
+      cols[k * 3] = col[0]; cols[k * 3 + 1] = col[1]; cols[k * 3 + 2] = col[2];
+    }
+  }
+
+  const under = document.createElement('canvas');
+  under.width = gw;
+  under.height = gh;
+  const ug = under.getContext('2d');
+  const img = ug.createImageData(gw, gh);
+  for (let k = 0; k < gw * gh; k++) {
+    img.data[k * 4] = cols[k * 3];
+    img.data[k * 4 + 1] = cols[k * 3 + 1];
+    img.data[k * 4 + 2] = cols[k * 3 + 2];
+    img.data[k * 4 + 3] = 255 * dens[k] * 0.8;
+  }
+  ug.putImageData(img, 0, 0);
+
+  const cv = document.createElement('canvas');
+  cv.width = cw;
+  cv.height = ch;
+  const g = cv.getContext('2d');
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(under, 0, 0, cw, ch);
+
+  const at = (i, j) => dens[Math.min(gh - 1, Math.max(0, j)) * gw + ((i % gw) + gw) % gw];
+  const tries = Math.floor(cw * ch / 9);
+  const scale = far ? 0.6 : 1;
+  for (let n = 0; n < tries; n++) {
+    const x = rnd() * cw, y = rnd() * ch;
+    const i = Math.min(gw - 1, (x / cw * gw) | 0), j = Math.min(gh - 1, (y / ch * gh) | 0);
+    const d = dens[j * gw + i];
+    if (d < 0.08) continue;
+    const gx = at(i + 1, j) - at(i - 1, j);
+    const gy = at(i, j + 1) - at(i, j - 1);
+    const rot = Math.atan2(gy, gx) + Math.PI / 2 + (rnd() - 0.5) * 0.7;
+    const k = (j * gw + i) * 3;
+    const col = jitter([cols[k], cols[k + 1], cols[k + 2]], rnd, 18);
+    const len = (3 + rnd() * 6) * scale, thick = len * (0.4 + rnd() * 0.2);
+    const a = Math.min(1, d * 1.3) * 0.9;
+    dab(g, x, y, len, thick, rot, col, a);
+    if (x < len * 2) dab(g, x + cw, y, len, thick, rot, col, a);
+    if (x > cw - len * 2) dab(g, x - cw, y, len, thick, rot, col, a);
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1;
+  return cv;
+}
+
+function makeGrain() {
+  const S = 128;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const g = cv.getContext('2d');
+  const img = g.createImageData(S, S);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const weave = ((x >> 1) + (y >> 1)) & 1 ? 9 : -9;
+      const v = 128 + (hash2(x, y, 7) - 0.5) * 70 + weave;
+      const o = (y * S + x) * 4;
+      img.data[o] = img.data[o + 1] = img.data[o + 2] = v;
+      img.data[o + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  return ctx.createPattern(cv, 'repeat');
+}
+
+function buildPainting() {
+  const cw = Math.max(200, Math.ceil(w / 1.6));
+  const ch = Math.max(260, Math.ceil(h / 1.6));
+  painting = makeLand(CLOUD_SEED, cw, ch);
+  cloudFar = makeClouds(CLOUD_SEED + 900, cw, ch, true);
+  cloudNear = makeClouds(CLOUD_SEED + 400, cw, ch, false);
+  if (!grain) grain = makeGrain();
+}
+
+function resize() {
+  if (innerWidth < 2 || innerHeight < 2) return;
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  w = innerWidth;
+  h = innerHeight;
+  c.width = Math.floor(w * dpr);
+  c.height = Math.floor(h * dpr);
+  c.style.width = w + 'px';
+  c.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.fillStyle = '#7fb0dc';
+  ctx.fillRect(0, 0, w, h);
+  if (!painting) buildPainting();
+  else {
+    clearTimeout(paintTimer);
+    paintTimer = setTimeout(buildPainting, 200);
+  }
+}
+resize();
+addEventListener('resize', resize);
+
+function seeded(seed) {
+  return () => {
+    seed |= 0;
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function plateAt(u, v) {
+  const x = Math.max(0, Math.min(plateW - 1.001, u));
+  const y = Math.max(0, Math.min(plateH - 1.001, v));
+  const x0 = x | 0, y0 = y | 0;
+  const fx = x - x0, fy = y - y0;
+  const i = (y0 * plateW + x0) * 4;
+  const j = i + 4;
+  const k = i + plateW * 4;
+  const l = k + 4;
+  const s = (a, b, t) => a + (b - a) * t;
+  const r = s(s(platePx[i], platePx[j], fx), s(platePx[k], platePx[l], fx), fy);
+  const g = s(s(platePx[i + 1], platePx[j + 1], fx), s(platePx[k + 1], platePx[l + 1], fx), fy);
+  const b = s(s(platePx[i + 2], platePx[j + 2], fx), s(platePx[k + 2], platePx[l + 2], fx), fy);
+  return [r, g, b];
+}
+
+function makeFilm(seed) {
+  const F = 256;
+  const C = F / 2;
+  const R = C * 0.97;
+  const rnd = seeded(seed);
+  const ox = rnd() * plateW;
+  const hue = rnd();
+  const spin = 1 + rnd() * 1.5;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = F;
+  const g = cv.getContext('2d');
+  const img = g.createImageData(F, F);
+  const od = img.data;
+  for (let y = 0; y < F; y++) {
+    for (let x = 0; x < F; x++) {
+      const nx = (x + 0.5 - C) / R;
+      const ny = (y + 0.5 - C) / R;
+      const rho = Math.sqrt(nx * nx + ny * ny);
+      if (rho > 1) continue;
+      const bend = 1 + 0.4 * rho * rho;
+      const u = ((ox + (0.5 + nx * bend * 0.5) * plateW * 0.55) % plateW + plateW) % plateW;
+      const v = (0.12 + (ny * bend * 0.5 + 0.5) * 0.82) * plateH;
+      const col = plateAt(u, v);
+      const rim = smooth(0.6, 0.99, rho);
+      const ang = Math.atan2(ny, nx);
+      const ph = ang / 6.2832 * spin + hue + rho * 0.6;
+      const ir = [
+        170 + 85 * Math.cos(6.2832 * ph),
+        170 + 85 * Math.cos(6.2832 * (ph - 0.33)),
+        170 + 85 * Math.cos(6.2832 * (ph - 0.67))
+      ];
+      const tint = rim * 0.55;
+      const lift = Math.max(0, -ny) * (1 - rho) * 30;
+      const o = (y * F + x) * 4;
+      od[o] = Math.min(255, col[0] * (1 - tint) + ir[0] * tint + lift);
+      od[o + 1] = Math.min(255, col[1] * (1 - tint) + ir[1] * tint + lift);
+      od[o + 2] = Math.min(255, col[2] * (1 - tint) + ir[2] * tint + lift * 0.6);
+      const edge = smooth(1, 0.955, rho);
+      od[o + 3] = 255 * (0.26 + rim * 0.62) * edge;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  return cv;
+}
+
+function makeBubbleSprite(S, film) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const g = cv.getContext('2d');
+  const C = S / 2;
+  const R = C * FILL;
+  g.imageSmoothingQuality = 'high';
+
+  const fd = R * 2 / 0.97;
+  g.drawImage(film, C - fd / 2, C - fd / 2, fd, fd);
+
+  const layer = (paint, mask) => {
+    const t = document.createElement('canvas');
+    t.width = t.height = S;
+    const x = t.getContext('2d');
+    paint(x);
+    if (mask) {
+      x.globalCompositeOperation = 'destination-in';
+      x.fillStyle = mask(x);
+      x.fillRect(0, 0, S, S);
+    }
+    g.drawImage(t, 0, 0);
+  };
+
+  const ring = (x, stops) => {
+    const rg = x.createRadialGradient(C, C, 0, C, C, R);
+    for (const [p, col] of stops) rg.addColorStop(p, col);
+    x.fillStyle = rg;
+    x.fillRect(0, 0, S, S);
+  };
+
+  layer(x => ring(x, [
+    [0, 'rgba(255,250,236,0)'],
+    [0.92, 'rgba(255,250,236,0)'],
+    [0.975, 'rgba(255,248,232,0.5)'],
+    [1, 'rgba(255,250,236,0)']
+  ]));
+
+  const rnd = seeded((film.width * 31 + S) | 0);
+  const arc = (from, to, rad, n, len, alpha, col) => {
+    for (let k = 0; k < n; k++) {
+      const a = from + (to - from) * (k + rnd() * 0.6) / n;
+      const rr = R * (rad + (rnd() - 0.5) * 0.04);
+      dab(g, C + Math.cos(a) * rr, C + Math.sin(a) * rr, R * len * (0.7 + rnd() * 0.6), R * len * 0.32, a + Math.PI / 2, col, alpha * (0.7 + rnd() * 0.3));
+    }
+  };
+  arc(-2.75, -1.75, 0.8, 7, 0.09, 0.85, [255, 252, 242]);
+  arc(-2.55, -2.0, 0.66, 3, 0.05, 0.55, [255, 246, 224]);
+  arc(0.35, 1.2, 0.84, 5, 0.07, 0.38, [236, 244, 255]);
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1;
+  const sx = C - R * 0.46, sy = C - R * 0.44;
+  const sg = g.createRadialGradient(sx, sy, 0, sx, sy, R * 0.09);
+  sg.addColorStop(0, 'rgba(255,255,248,0.95)');
+  sg.addColorStop(0.5, 'rgba(255,250,236,0.6)');
+  sg.addColorStop(1, 'rgba(255,240,210,0)');
+  g.fillStyle = sg;
+  g.fillRect(0, 0, S, S);
+
+  return cv;
+}
+
+function warpSprite(src, S, shape) {
+  const C = S / 2;
+  const sd = src.getContext('2d').getImageData(0, 0, S, S).data;
+  const out = document.createElement('canvas');
+  out.width = out.height = S;
+  const ox = out.getContext('2d');
+  const img = ox.createImageData(S, S);
+  const od = img.data;
+  const norm = 1 + shape.reduce((s, k) => s + k.a, 0);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const dx = x + 0.5 - C;
+      const dy = y + 0.5 - C;
+      const th = Math.atan2(dy, dx);
+      let f = 1;
+      for (const k of shape) f += k.a * Math.sin(k.n * th + k.p);
+      f /= norm;
+      const sx = C + dx / f - 0.5;
+      const sy = C + dy / f - 0.5;
+      const x0 = Math.floor(sx), y0 = Math.floor(sy);
+      if (x0 < 0 || y0 < 0 || x0 >= S - 1 || y0 >= S - 1) continue;
+      const fx = sx - x0, fy = sy - y0;
+      let r = 0, g = 0, b = 0, a = 0;
+      for (let j = 0; j < 4; j++) {
+        const px = x0 + (j & 1), py = y0 + (j >> 1);
+        const wgt = ((j & 1) ? fx : 1 - fx) * ((j >> 1) ? fy : 1 - fy);
+        const i = (py * S + px) * 4;
+        const al = sd[i + 3] * wgt;
+        r += sd[i] * al; g += sd[i + 1] * al; b += sd[i + 2] * al; a += al;
+      }
+      const o = (y * S + x) * 4;
+      if (a > 0) {
+        od[o] = r / a; od[o + 1] = g / a; od[o + 2] = b / a; od[o + 3] = a;
+      }
+    }
+  }
+  ox.putImageData(img, 0, 0);
+  return out;
+}
+
+const plate = makeLand(CLOUD_SEED + 17, 220, 240);
+plate.getContext('2d').drawImage(makeClouds(CLOUD_SEED + 31, 220, 240, false), 0, 0);
+plateW = plate.width;
+plateH = plate.height;
+platePx = plate.getContext('2d').getImageData(0, 0, plateW, plateH).data;
+
+const SIZES = [48, 128, 320, 640];
+const sprites = [];
+for (let v = 0; v < VARIANTS; v++) {
+  const film = makeFilm((Math.random() * 1e9) | 0);
+  const shape = [
+    { n: 2, a: 0.02 + Math.random() * 0.025, p: Math.random() * 6.28 },
+    { n: 3, a: 0.01 + Math.random() * 0.02, p: Math.random() * 6.28 },
+    { n: 4, a: Math.random() * 0.01, p: Math.random() * 6.28 },
+    { n: 5, a: Math.random() * 0.006, p: Math.random() * 6.28 }
+  ];
+  sprites.push(SIZES.map(s => ({ size: s, img: warpSprite(makeBubbleSprite(s, film), s, shape) })));
+}
+
+const bokehSprites = sprites.map(set => {
+  const S = 128, pad = 16;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S + pad * 2;
+  const g = cv.getContext('2d');
+  g.filter = 'blur(5px)';
+  g.drawImage(set[1].img, pad, pad, S, S);
+  return cv;
+});
+
+function makeSpark(S, warm) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const g = cv.getContext('2d');
+  const C = S / 2;
+  const rg = g.createRadialGradient(C, C, 0, C, C, C);
+  const col = warm ? '255,240,206' : '255,252,246';
+  rg.addColorStop(0, `rgba(${col},0.95)`);
+  rg.addColorStop(0.55, `rgba(${col},0.8)`);
+  rg.addColorStop(0.8, `rgba(${col},0.35)`);
+  rg.addColorStop(1, `rgba(${col},0)`);
+  g.fillStyle = rg;
+  g.fillRect(0, 0, S, S);
+  return cv;
+}
+const sparks = [makeSpark(64, true), makeSpark(64, false)];
+
+const WAND_W = 84, WAND_H = 190, WAND_CX = 42, WAND_CY = 36, WAND_R = 24, WAND_T = 7;
+const WAND_BASE = -0.55;
+const WOOD_D = [104, 64, 40], WOOD = [172, 114, 66], WOOD_L = [226, 176, 112], WOOD_HI = [252, 228, 176];
+const RIB_D = [138, 30, 38], RIB = [204, 58, 54], RIB_L = [246, 124, 98];
+
+function mix(a, b, k) {
+  return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+}
+
+function woodTone(lit) {
+  lit = Math.max(0, Math.min(1, lit));
+  return lit < 0.5 ? mix(WOOD_D, WOOD, lit * 2) : mix(WOOD, WOOD_L, (lit - 0.5) * 2);
+}
+
+function makeWand() {
+  const K = 3;
+  const cv = document.createElement('canvas');
+  cv.width = WAND_W * K;
+  cv.height = WAND_H * K;
+  const g = cv.getContext('2d');
+  const rnd = seeded(CLOUD_SEED + 77);
+  const d = (x, y, len, thick, rot, col, a) => dab(g, x * K, y * K, len * K, thick * K, rot, col, a);
+  const base = () => g.setTransform(K, 0, 0, K, 0, 0);
+  const css = col => `rgb(${col[0] | 0},${col[1] | 0},${col[2] | 0})`;
+
+  const top = WAND_CY + WAND_R - 2, bot = WAND_H - 4, hw = 4;
+  base();
+  g.fillStyle = css(WOOD);
+  g.beginPath();
+  g.moveTo(WAND_CX - hw, top);
+  g.lineTo(WAND_CX + hw, top);
+  g.lineTo(WAND_CX + hw * 0.85, bot - 3);
+  g.quadraticCurveTo(WAND_CX, bot + 2, WAND_CX - hw * 0.85, bot - 3);
+  g.closePath();
+  g.fill();
+  for (let i = 0; i < 420; i++) {
+    const y = top + rnd() * (bot - top - 2);
+    const taper = 1 - (y - top) / (bot - top) * 0.15;
+    const ox = (rnd() * 2 - 1) * hw * taper * 0.85;
+    const lit = 0.45 + (ox / hw) * 0.5 + (rnd() - 0.5) * 0.25;
+    d(WAND_CX + ox, y, 2.5 + rnd() * 4, 0.7 + rnd() * 0.7, Math.PI / 2 + (rnd() - 0.5) * 0.08, jitter(woodTone(lit), rnd, 18), 0.75);
+  }
+  for (let i = 0; i < 26; i++) {
+    const y = top + rnd() * (bot - top - 6);
+    d(WAND_CX + hw * (0.35 + rnd() * 0.3), y, 3 + rnd() * 6, 0.45, Math.PI / 2, WOOD_HI, 0.55);
+  }
+  for (let i = 0; i < 18; i++) {
+    const y = top + rnd() * (bot - top - 6);
+    d(WAND_CX + (rnd() - 0.6) * hw, y, 1.5 + rnd() * 3, 0.35, Math.PI / 2, WOOD_D, 0.5);
+  }
+
+  base();
+  g.strokeStyle = css(WOOD);
+  g.lineWidth = WAND_T;
+  g.beginPath();
+  g.arc(WAND_CX, WAND_CY, WAND_R, 0, Math.PI * 2);
+  g.stroke();
+  const L = [0.62, -0.78];
+  const TEETH = 26, rin = WAND_R - WAND_T * 0.45, depth = 3.2;
+  for (let i = 0; i < TEETH; i++) {
+    const a = (i / TEETH) * Math.PI * 2;
+    const half = Math.PI / TEETH * 0.62;
+    const tip = rin - depth * (0.85 + rnd() * 0.3);
+    const lit = 0.5 + (Math.cos(a) * -L[0] + Math.sin(a) * -L[1]) * 0.45;
+    base();
+    g.fillStyle = css(woodTone(lit));
+    g.beginPath();
+    g.moveTo(WAND_CX + Math.cos(a - half) * (rin + 1), WAND_CY + Math.sin(a - half) * (rin + 1));
+    g.quadraticCurveTo(
+      WAND_CX + Math.cos(a) * tip * 0.96, WAND_CY + Math.sin(a) * tip * 0.96,
+      WAND_CX + Math.cos(a + half) * (rin + 1), WAND_CY + Math.sin(a + half) * (rin + 1)
+    );
+    g.closePath();
+    g.fill();
+    const mx = WAND_CX + Math.cos(a) * (tip + 1.2), my = WAND_CY + Math.sin(a) * (tip + 1.2);
+    d(mx, my, 1.4, 0.6, a, jitter(woodTone(lit + 0.15), rnd, 16), 0.8);
+  }
+  for (let i = 0; i < 520; i++) {
+    const a = rnd() * Math.PI * 2;
+    const o = (rnd() * 2 - 1) * WAND_T * 0.42;
+    const cx = Math.cos(a), sy = Math.sin(a);
+    const facing = (cx * L[0] + sy * L[1]) * (o / (WAND_T * 0.5));
+    const lit = 0.5 + facing * 0.5 + (rnd() - 0.5) * 0.25;
+    d(WAND_CX + cx * (WAND_R + o), WAND_CY + sy * (WAND_R + o), 1.8 + rnd() * 2.6, 0.7 + rnd() * 0.6, a + Math.PI / 2, jitter(woodTone(lit), rnd, 18), 0.8);
+  }
+  for (let i = 0; i < 40; i++) {
+    const a = -1.9 + rnd() * 1.6;
+    const o = WAND_T * (0.15 + rnd() * 0.2);
+    d(WAND_CX + Math.cos(a) * (WAND_R + o), WAND_CY + Math.sin(a) * (WAND_R + o), 1.5 + rnd() * 2.5, 0.45, a + Math.PI / 2, WOOD_HI, 0.7);
+  }
+
+  const kx = WAND_CX, ky = WAND_CY + WAND_R + 4;
+  const loops = [[kx - 11, ky - 3, 0.35], [kx + 11, ky - 3, -0.35]];
+  const tails = [[kx - 2, ky + 2, kx - 12, ky + 14, kx - 8, ky + 27], [kx + 2, ky + 2, kx + 12, ky + 12, kx + 10, ky + 25]];
+  base();
+  g.fillStyle = css(RIB);
+  for (const [x, y, r] of loops) {
+    g.beginPath();
+    g.ellipse(x, y, 11, 6.5, r, 0, Math.PI * 2);
+    g.fill();
+  }
+  g.lineCap = 'round';
+  g.strokeStyle = css(RIB);
+  g.lineWidth = 5;
+  for (const t of tails) {
+    g.beginPath();
+    g.moveTo(t[0], t[1]);
+    g.quadraticCurveTo(t[2], t[3], t[4], t[5]);
+    g.stroke();
+  }
+  for (const [x, y, r] of loops) {
+    for (let i = 0; i < 90; i++) {
+      const a = rnd() * Math.PI * 2;
+      const k = 0.35 + rnd() * 0.6;
+      const px = Math.cos(a) * 11 * k, py = Math.sin(a) * 6.5 * k;
+      const rx = px * Math.cos(r) - py * Math.sin(r), ry = px * Math.sin(r) + py * Math.cos(r);
+      const lit = 0.5 - Math.sin(a) * 0.4 * k + (rnd() - 0.5) * 0.3;
+      const col = lit < 0.5 ? mix(RIB_D, RIB, lit * 2) : mix(RIB, RIB_L, (lit - 0.5) * 2);
+      d(x + rx, y + ry, 1.6 + rnd() * 2, 0.7 + rnd() * 0.5, a + r + Math.PI / 2, jitter(col, rnd, 16), 0.8);
+    }
+    d(x + (x < kx ? 2 : -2), y + 1, 4, 1.6, r, RIB_D, 0.7);
+  }
+  for (const t of tails) {
+    for (let i = 0; i < 40; i++) {
+      const s = rnd(), u = 1 - s;
+      const px = u * u * t[0] + 2 * u * s * t[2] + s * s * t[4];
+      const py = u * u * t[1] + 2 * u * s * t[3] + s * s * t[5];
+      const tx = 2 * u * (t[2] - t[0]) + 2 * s * (t[4] - t[2]);
+      const ty = 2 * u * (t[3] - t[1]) + 2 * s * (t[5] - t[3]);
+      const col = rnd() < 0.3 ? RIB_L : rnd() < 0.5 ? RIB_D : RIB;
+      d(px + (rnd() - 0.5) * 2.5, py, 1.8 + rnd() * 2, 0.7, Math.atan2(ty, tx), jitter(col, rnd, 16), 0.75);
+    }
+  }
+  base();
+  g.fillStyle = css(RIB_D);
+  g.beginPath();
+  g.ellipse(kx, ky, 4.5, 4, 0, 0, Math.PI * 2);
+  g.fill();
+  d(kx - 1, ky - 1.5, 2.5, 1.1, 0.4, RIB_L, 0.8);
+
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1;
+  return cv;
+}
+const wandImg = makeWand();
+const wand = { x: 0, y: 0, px: 0, py: 0, ang: WAND_BASE, angV: 0, vis: 0, show: 0, press: 0, film: 1 };
+
+function aimWand(x, y) {
+  if (wand.vis < 0.05) { wand.px = x; wand.py = y; }
+  wand.x = x;
+  wand.y = y;
+  wand.show = 1;
+}
+
+function stepWand(t) {
+  const vx = wand.x - wand.px;
+  wand.px = wand.x;
+  wand.py = wand.y;
+  const target = WAND_BASE + Math.max(-0.6, Math.min(0.6, vx * 0.03)) + Math.sin(t * 0.0016) * 0.04;
+  wand.angV += (target - wand.ang) * 0.12;
+  wand.angV *= 0.78;
+  wand.ang += wand.angV;
+  wand.vis += (wand.show - wand.vis) * 0.2;
+  let pressed = false, blowing = false;
+  for (const p of pointers.values()) {
+    pressed = true;
+    if (p.bubble) blowing = true;
+  }
+  wand.press += ((pressed ? 1 : 0) - wand.press) * 0.25;
+  wand.film = blowing ? 0 : Math.min(1, wand.film + 0.03);
+}
+
+function drawWand(t) {
+  if (wand.vis < 0.02) return;
+  ctx.save();
+  ctx.translate(wand.x, wand.y);
+  ctx.rotate(wand.ang);
+  const s = (compactView() ? 1.15 : 1.45) * (1 - wand.press * 0.06);
+  ctx.scale(s, s);
+  ctx.globalAlpha = wand.vis;
+  if (wand.film > 0.01) {
+    const fr = WAND_R - WAND_T * 0.45 - 1.5;
+    const a = t * 0.0006;
+    const lg = ctx.createLinearGradient(Math.cos(a) * fr, Math.sin(a) * fr, -Math.cos(a) * fr, -Math.sin(a) * fr);
+    const f = wand.film;
+    lg.addColorStop(0, `rgba(255,196,224,${0.32 * f})`);
+    lg.addColorStop(0.35, `rgba(196,236,255,${0.22 * f})`);
+    lg.addColorStop(0.65, `rgba(214,255,212,${0.2 * f})`);
+    lg.addColorStop(1, `rgba(255,236,186,${0.32 * f})`);
+    ctx.fillStyle = lg;
+    ctx.beginPath();
+    ctx.arc(0, 0, fr, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(255,252,240,${0.55 * f})`;
+    ctx.lineWidth = 2.2;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(0, 0, fr * 0.72, -2.6, -1.7);
+    ctx.stroke();
+  }
+  ctx.drawImage(wandImg, -WAND_CX, -WAND_CY, WAND_W, WAND_H);
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+const EIGHTH = 60 / 76 / 2;
+const CHORDS = [
+  { bass: 41, pad: [53, 57, 60, 64], arp: [41, 53, 57, 60, 64, 60, 57, 53] },
+  { bass: 43, pad: [55, 59, 62, 65], arp: [43, 55, 59, 62, 65, 62, 59, 55] },
+  { bass: 40, pad: [52, 55, 59, 62], arp: [40, 52, 55, 59, 62, 59, 55, 52] },
+  { bass: 45, pad: [55, 57, 60, 64], arp: [45, 52, 57, 60, 64, 60, 57, 52] },
+  { bass: 38, pad: [53, 57, 60, 62], arp: [38, 50, 53, 57, 60, 57, 53, 50] },
+  { bass: 43, pad: [55, 60, 62, 65], arp: [43, 55, 60, 62, 65, 62, 60, 55] },
+  { bass: 36, pad: [52, 55, 59, 64], arp: [36, 48, 52, 55, 59, 55, 52, 48] },
+  { bass: 36, pad: [52, 55, 58, 64], arp: [36, 48, 52, 55, 58, 55, 52, 48] }
+];
+const MELODY = [
+  [[0, 76, 2], [2, 77, 1], [3, 79, 1], [4, 81, 4]],
+  [[0, 79, 3], [3, 77, 1], [4, 74, 4]],
+  [[0, 71, 2], [2, 74, 2], [4, 79, 3], [7, 81, 1]],
+  [[0, 79, 6], [6, 76, 2]],
+  [[0, 77, 2], [2, 76, 1], [3, 74, 1], [4, 72, 4]],
+  [[0, 74, 2], [2, 72, 1], [3, 74, 1], [4, 79, 4]],
+  [[0, 76, 8]],
+  [[4, 67, 1], [5, 69, 1], [6, 72, 2]]
+];
+
+let actx = null, master, musicBus, sfxBus, verb, noiseBuf, breath, breathF;
+let muted = false, lastBloop = 0, lastPop = 0, nextBird = 0;
+const music = { next: 0, step: 0 };
+
+try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (err) {}
+let unlocked = false, keepAlive = null, schedTimer = 0;
+
+function silentWav() {
+  const n = 4410, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const s = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+  s(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); s(8, 'WAVE'); s(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 44100, true); v.setUint32(28, 88200, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  s(36, 'data'); v.setUint32(40, n * 2, true);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
+function unlockAudio() {
+  const ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (ios && !unlocked) {
+    unlocked = true;
+    if (!keepAlive) {
+      keepAlive = new Audio(silentWav());
+      keepAlive.loop = true;
+      keepAlive.setAttribute('playsinline', '');
+    }
+    const p = keepAlive.play();
+    if (p && p.catch) p.catch(() => { unlocked = false; });
+  }
+  if (actx && actx.state !== 'running' && (actx.tries || 0) > 1) {
+    try { actx.close(); } catch (err) {}
+    actx = null;
+  }
+  startAudio();
+  if (!actx) return;
+  if (actx.state !== 'running') {
+    actx.tries = (actx.tries || 0) + 1;
+    const r = actx.resume();
+    if (r && r.then) r.then(() => { if (actx) actx.tries = 0; }, () => {});
+  }
+  const sb = actx.createBufferSource();
+  sb.buffer = actx.createBuffer(1, 1, actx.sampleRate);
+  sb.connect(actx.destination);
+  sb.start(0);
+  if (!ios) unlocked = true;
+}
+
+function midiHz(m) {
+  return 440 * Math.pow(2, (m - 69) / 12);
+}
+
+function currentChord() {
+  return CHORDS[Math.floor(music.step / 8) % 8];
+}
+
+function startAudio() {
+  if (actx) {
+    if (actx.state !== 'running') actx.resume();
+    return;
+  }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  actx = new AC();
+  const now = actx.currentTime;
+  const comp = actx.createDynamicsCompressor();
+  comp.threshold.value = -16;
+  comp.ratio.value = 3;
+  comp.connect(actx.destination);
+  master = actx.createGain();
+  master.gain.setValueAtTime(0, now);
+  master.gain.setTargetAtTime(muted ? 0 : 0.9, now, 1.2);
+  master.connect(comp);
+
+  const len = actx.sampleRate * 3.2 | 0;
+  const ir = actx.createBuffer(2, len, actx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = ir.getChannelData(ch);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.8);
+  }
+  verb = actx.createConvolver();
+  verb.buffer = ir;
+  const wet = actx.createGain();
+  wet.gain.value = 0.5;
+  verb.connect(wet);
+  wet.connect(master);
+
+  musicBus = actx.createGain();
+  musicBus.gain.value = 0.34;
+  musicBus.connect(master);
+  const ms = actx.createGain();
+  ms.gain.value = 0.55;
+  musicBus.connect(ms);
+  ms.connect(verb);
+
+  sfxBus = actx.createGain();
+  sfxBus.gain.value = 0.55;
+  sfxBus.connect(master);
+  const ss = actx.createGain();
+  ss.gain.value = 0.3;
+  sfxBus.connect(ss);
+  ss.connect(verb);
+
+  noiseBuf = actx.createBuffer(1, actx.sampleRate * 2, actx.sampleRate);
+  const nd = noiseBuf.getChannelData(0);
+  let pink = 0;
+  for (let i = 0; i < nd.length; i++) {
+    pink = pink * 0.97 + (Math.random() * 2 - 1) * 0.03;
+    nd[i] = (Math.random() * 2 - 1) * 0.5 + pink * 6;
+  }
+
+  const wind = actx.createBufferSource();
+  wind.buffer = noiseBuf;
+  wind.loop = true;
+  const wf = actx.createBiquadFilter();
+  wf.type = 'lowpass';
+  wf.frequency.value = 420;
+  const wg = actx.createGain();
+  wg.gain.value = 0.05;
+  const lfo = actx.createOscillator();
+  lfo.frequency.value = 0.07;
+  const lfoG = actx.createGain();
+  lfoG.gain.value = 0.035;
+  lfo.connect(lfoG);
+  lfoG.connect(wg.gain);
+  const lfo2 = actx.createOscillator();
+  lfo2.frequency.value = 0.045;
+  const lfo2G = actx.createGain();
+  lfo2G.gain.value = 220;
+  lfo2.connect(lfo2G);
+  lfo2G.connect(wf.frequency);
+  wind.connect(wf);
+  wf.connect(wg);
+  wg.connect(master);
+  wind.start(now);
+  lfo.start(now);
+  lfo2.start(now);
+
+  const bsrc = actx.createBufferSource();
+  bsrc.buffer = noiseBuf;
+  bsrc.loop = true;
+  breathF = actx.createBiquadFilter();
+  breathF.type = 'bandpass';
+  breathF.frequency.value = 900;
+  breathF.Q.value = 0.9;
+  breath = actx.createGain();
+  breath.gain.value = 0;
+  bsrc.connect(breathF);
+  breathF.connect(breath);
+  breath.connect(sfxBus);
+  bsrc.start(now);
+
+  music.next = now + 0.4;
+  nextBird = now + 4 + Math.random() * 6;
+  if (!schedTimer) schedTimer = setInterval(schedule, 90);
+}
+
+function voice(type, f, gain) {
+  const o = actx.createOscillator();
+  o.type = type;
+  o.frequency.value = f;
+  const g = actx.createGain();
+  g.gain.value = gain;
+  o.connect(g);
+  return [o, g];
+}
+
+function piano(m, t, dur, vel) {
+  const f = midiHz(m);
+  const env = actx.createGain();
+  const lp = actx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = Math.min(5000, f * 5);
+  env.gain.setValueAtTime(0, t);
+  env.gain.linearRampToValueAtTime(vel, t + 0.01);
+  env.gain.exponentialRampToValueAtTime(vel * 0.3, t + 0.35);
+  env.gain.exponentialRampToValueAtTime(0.0005, t + dur + 1.4);
+  const [o1, g1] = voice('triangle', f, 1);
+  const [o2, g2] = voice('sine', f * 2.002, 0.22);
+  g1.connect(lp);
+  g2.connect(lp);
+  lp.connect(env);
+  env.connect(musicBus);
+  const end = t + dur + 1.5;
+  o1.start(t); o2.start(t);
+  o1.stop(end); o2.stop(end);
+}
+
+function bell(m, t, vel, bus) {
+  const f = midiHz(m);
+  const env = actx.createGain();
+  env.gain.setValueAtTime(0, t);
+  env.gain.linearRampToValueAtTime(vel, t + 0.004);
+  env.gain.exponentialRampToValueAtTime(0.0005, t + 1.8);
+  const [o1, g1] = voice('sine', f, 1);
+  const [o2, g2] = voice('sine', f * 4.01, 0.18);
+  g2.gain.setValueAtTime(0.18, t);
+  g2.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+  g1.connect(env);
+  g2.connect(env);
+  env.connect(bus || musicBus);
+  o1.start(t); o2.start(t);
+  o1.stop(t + 1.9); o2.stop(t + 1.9);
+}
+
+function pad(notes, t, dur, vel) {
+  const lp = actx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 650;
+  const env = actx.createGain();
+  env.gain.setValueAtTime(0, t);
+  env.gain.linearRampToValueAtTime(vel, t + 1.1);
+  env.gain.setValueAtTime(vel, t + dur);
+  env.gain.linearRampToValueAtTime(0, t + dur + 1.6);
+  lp.connect(env);
+  env.connect(musicBus);
+  for (const m of notes) {
+    for (const det of [-7, 7]) {
+      const o = actx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = midiHz(m);
+      o.detune.value = det;
+      o.connect(lp);
+      o.start(t);
+      o.stop(t + dur + 1.7);
+    }
+  }
+}
+
+function bird(t) {
+  const n = 2 + (Math.random() * 3) | 0;
+  const base = 2600 + Math.random() * 1200;
+  for (let i = 0; i < n; i++) {
+    const s = t + i * (0.11 + Math.random() * 0.06);
+    const o = actx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(base, s);
+    o.frequency.exponentialRampToValueAtTime(base * (1.3 + Math.random() * 0.3), s + 0.05);
+    o.frequency.exponentialRampToValueAtTime(base * 0.9, s + 0.09);
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0, s);
+    g.gain.linearRampToValueAtTime(0.018, s + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0005, s + 0.1);
+    o.connect(g);
+    g.connect(musicBus);
+    o.start(s);
+    o.stop(s + 0.12);
+  }
+}
+
+function schedule() {
+  if (!actx || actx.state !== 'running') return;
+  while (music.next < actx.currentTime + 0.5) {
+    const t = music.next;
+    const bar = Math.floor(music.step / 8) % 8, e = music.step % 8;
+    const loop = Math.floor(music.step / 64) % 3;
+    const ch = CHORDS[bar];
+    if (e === 0) {
+      pad(ch.pad, t, EIGHTH * 8, 0.022);
+      piano(ch.bass, t, EIGHTH * 6, 0.15);
+    }
+    if (e > 0) piano(ch.arp[e], t + Math.random() * 0.012, EIGHTH * 1.5, e % 2 ? 0.055 : 0.07);
+    if (loop < 2) {
+      for (const [at, m, l] of MELODY[bar]) {
+        if (at !== e) continue;
+        if (loop === 0) piano(m, t, EIGHTH * l, 0.12);
+        else bell(m + 12, t, 0.07);
+      }
+    } else if ((e === 0 || e === 4) && Math.random() < 0.6) {
+      bell(ch.pad[(Math.random() * 4) | 0] + 24, t, 0.04);
+    }
+    music.step++;
+    music.next += EIGHTH;
+  }
+  if (actx.currentTime > nextBird) {
+    bird(actx.currentTime + 0.05);
+    nextBird = actx.currentTime + 7 + Math.random() * 12;
+  }
+}
+
+function panned(x) {
+  if (!actx.createStereoPanner) return sfxBus;
+  const p = actx.createStereoPanner();
+  p.pan.value = Math.max(-0.8, Math.min(0.8, (x / Math.max(w, 1)) * 2 - 1));
+  p.connect(sfxBus);
+  return p;
+}
+
+function bloopSound(x, size) {
+  if (!actx) return;
+  const t = actx.currentTime + 0.005;
+  if (t - lastBloop < 0.07) return;
+  lastBloop = t;
+  const ch = currentChord();
+  const lift = size > 70 ? 12 : 24;
+  const f = midiHz(ch.pad[(Math.random() * 4) | 0] + lift);
+  const out = panned(x);
+  for (let k = 0; k < 2; k++) {
+    const s = t + k * 0.075;
+    const fk = k ? f * 1.5 : f;
+    const o = actx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(fk * 0.5, s);
+    o.frequency.exponentialRampToValueAtTime(fk * 1.12, s + 0.055);
+    o.frequency.exponentialRampToValueAtTime(fk, s + 0.1);
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0, s);
+    g.gain.linearRampToValueAtTime(k ? 0.26 : 0.4, s + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0005, s + 0.17);
+    o.connect(g);
+    g.connect(out);
+    o.start(s);
+    o.stop(s + 0.19);
+  }
+  const src = actx.createBufferSource();
+  src.buffer = noiseBuf;
+  const bp = actx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = 1600;
+  bp.Q.value = 0.7;
+  const ng = actx.createGain();
+  ng.gain.setValueAtTime(0, t);
+  ng.gain.linearRampToValueAtTime(0.09, t + 0.01);
+  ng.gain.exponentialRampToValueAtTime(0.0005, t + 0.12);
+  src.connect(bp);
+  bp.connect(ng);
+  ng.connect(out);
+  src.start(t, Math.random() * 1.5, 0.14);
+}
+
+function popSound(b) {
+  if (!actx || actx.state !== 'running') return;
+  const t = actx.currentTime;
+  if (t - lastPop < 0.035) return;
+  lastPop = t;
+  const out = panned(b.x);
+  const vel = Math.min(0.5, 0.18 + b.r * 0.004);
+  const src = actx.createBufferSource();
+  src.buffer = noiseBuf;
+  const bp = actx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = Math.max(1400, 5200 - b.r * 32);
+  bp.Q.value = 1.1;
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(vel, t + 0.002);
+  g.gain.exponentialRampToValueAtTime(0.0005, t + 0.07);
+  src.connect(bp);
+  bp.connect(g);
+  g.connect(out);
+  src.start(t, Math.random() * 1.5, 0.09);
+
+  const o = actx.createOscillator();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(1600 - Math.min(800, b.r * 8), t);
+  o.frequency.exponentialRampToValueAtTime(260, t + 0.05);
+  const og = actx.createGain();
+  og.gain.setValueAtTime(vel * 0.5, t);
+  og.gain.exponentialRampToValueAtTime(0.0005, t + 0.06);
+  o.connect(og);
+  og.connect(out);
+  o.start(t);
+  o.stop(t + 0.07);
+
+  if (Math.random() < 0.7) {
+    const ch = currentChord();
+    bell(ch.pad[(Math.random() * 4) | 0] + 24, t + 0.02, 0.035 + Math.min(0.03, b.r * 0.0004), out);
+  }
+}
+
+function stepAudio(t) {
+  if (!actx || !breath) return;
+  let blowing = null;
+  for (const p of pointers.values()) {
+    if (p.bubble && t - (p.moveT || 0) > 140) blowing = p.bubble;
+  }
+  const at = actx.currentTime;
+  breath.gain.setTargetAtTime(blowing ? 0.07 : 0, at, blowing ? 0.08 : 0.05);
+  if (blowing) breathF.frequency.setTargetAtTime(700 + Math.min(900, blowing.r * 6), at, 0.1);
+}
+
+function setMuted(m) {
+  muted = m;
+  if (actx) master.gain.setTargetAtTime(muted ? 0 : 0.9, actx.currentTime, 0.15);
+}
+
+function spriteFor(r, v) {
+  const set = sprites[v % VARIANTS];
+  const px = r * 2 * dpr;
+  for (const s of set) if (s.size >= px * 0.9) return s.img;
+  return set[set.length - 1].img;
+}
+
+function drawSprite(x, y, r, alpha, v) {
+  const d = r * 2 / FILL;
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(spriteFor(r, v), x - d / 2, y - d / 2, d, d);
+  ctx.globalAlpha = 1;
+}
+
+function sizeRoll() {
+  const k = Math.random();
+  return MIN_R + k * k * 50 * sizeMood + Math.random() * 8;
+}
+
+for (let i = 0; i < 90; i++) {
+  const z = Math.random();
+  const blurry = z < 0.6;
+  dust.push({
+    x: Math.random(),
+    y: Math.random(),
+    z,
+    kind: blurry ? 1 : 0,
+    vx: (Math.random() - 0.5) * 0.00008,
+    vy: -(0.00003 + z * 0.00016),
+    r: blurry ? 14 + Math.random() * 40 : 10 + (z - 0.6) * 55 + Math.random() * 6,
+    alpha: blurry ? 0.35 + z * 0.5 : 0.75 + Math.random() * 0.25,
+    phase: Math.random() * Math.PI * 2,
+    v: (Math.random() * VARIANTS) | 0
+  });
+}
+for (let i = 0; i < 45; i++) {
+  const z = Math.random() * 0.5;
+  dust.push({
+    x: Math.random(),
+    y: Math.random(),
+    z,
+    kind: 2,
+    vx: (Math.random() - 0.5) * 0.00006,
+    vy: -(0.00002 + z * 0.0001),
+    r: 3 + Math.random() * Math.random() * 12,
+    alpha: 0.5 + Math.random() * 0.45,
+    phase: Math.random() * Math.PI * 2,
+    v: Math.random() < 0.6 ? 0 : 1
+  });
+}
+dust.sort((a, b) => a.z - b.z);
+
+function maxR() {
+  return Math.min(w, h) * 0.32;
+}
+
+function compactView() {
+  return w <= 768;
+}
+
+function lifespan() {
+  return 3000 + Math.random() * 10000;
+}
+
+function spawn(x, y, target) {
+  const limit = compactView() ? 30 : 90;
+  if (bubbles.length >= limit) {
+    let oldest = -1;
+    for (let i = 0; i < bubbles.length; i++) {
+      if (bubbles[i].held || bubbles[i].dead) continue;
+      if (oldest < 0 || bubbles[i].born < bubbles[oldest].born) oldest = i;
+    }
+    if (oldest >= 0) bubbles[oldest].dead = true;
+  }
+  const now = performance.now();
+  const b = {
+    x, y,
+    r: Math.min(target, MIN_R) * 0.8,
+    target: Math.max(MIN_R, target),
+    v: (Math.random() * VARIANTS) | 0,
+    vx: (Math.random() - 0.5) * 0.5 + driftMood,
+    vy: -0.15 - Math.random() * 0.4,
+    phase: Math.random() * Math.PI * 2,
+    wob: 0.015 + Math.random() * 0.015,
+    jiggle: 0,
+    born: now,
+    die: now + lifespan(),
+    held: null,
+    dead: false
+  };
+  bubbles.push(b);
+  return b;
+}
+
+function burst(b) {
+  const n = Math.min(50, 14 + (b.r * 0.3) | 0);
+  for (let i = 0; i < n; i++) {
+    if (droplets.length > 700) droplets.shift();
+    const a = (i / n) * Math.PI * 2 + Math.random() * 0.4;
+    const edge = 0.75 + Math.random() * 0.25;
+    const sp = 0.6 + Math.random() * 2.4 + b.r * 0.02;
+    droplets.push({
+      x: b.x + Math.cos(a) * b.r * edge,
+      y: b.y + Math.sin(a) * b.r * edge,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp - 0.3,
+      life: 1,
+      decay: 0.012 + Math.random() * 0.015,
+      size: 2 + Math.random() * Math.random() * (4 + b.r * 0.05),
+      v: (Math.random() * VARIANTS) | 0
+    });
+  }
+  flashes.push({ x: b.x, y: b.y, r: b.r, grow: 2 + b.r * 0.04, life: 1 });
+  popSound(b);
+}
+
+(function seed() {
+  const count = 6 + (Math.random() * 4) | 0;
+  for (let i = 0; i < count; i++) {
+    const b = spawn(w * (0.12 + Math.random() * 0.76), h * (0.12 + Math.random() * 0.76), sizeRoll());
+    b.r = b.target;
+  }
+})();
+
+function grabAt(p, x, y, now, size) {
+  const b = spawn(x, y, size || MIN_R);
+  b.held = p;
+  b.die = Infinity;
+  b.vx = b.vy = 0;
+  p.bubble = b;
+  p.start = now;
+  p.growT = 0;
+  bloopSound(x, b.target);
+}
+
+function release(b) {
+  b.held = null;
+  b.target = Math.max(b.target, MIN_R);
+  b.die = performance.now() + lifespan();
+  b.vx = driftMood * 0.3 + (Math.random() - 0.5) * 0.04;
+  b.vy = -0.08 + (Math.random() - 0.5) * 0.04;
+}
+
+function trail(p, moved) {
+  p.travel = (p.travel || 0) + moved;
+  if (!p.nextStep) p.nextStep = compactView()
+    ? 52 + Math.random() * 24
+    : 16 + Math.random() * 22;
+  if (p.travel < p.nextStep) return;
+  p.travel = 0;
+  p.nextStep = 0;
+  const now = performance.now();
+  if (p.bubble) release(p.bubble);
+  const size = sizeRoll();
+  const jx = (Math.random() - 0.5) * size;
+  const jy = (Math.random() - 0.5) * size;
+  grabAt(p, p.x + jx, p.y + jy, now, size);
+  if (Math.random() < (compactView() ? 0.08 : 0.45)) {
+    const s2 = sizeRoll();
+    const a = Math.random() * Math.PI * 2;
+    const d = (0.4 + Math.random() * 0.9) * (size + s2) * 0.5;
+    const extra = spawn(p.x + Math.cos(a) * d, p.y + Math.sin(a) * d, s2);
+    extra.r = extra.target * 0.85;
+    release(extra);
+  }
+}
+
+let ambientTick = 0;
+let lastT = 0;
+
+function step(t) {
+  const dt = lastT ? Math.min(0.05, (t - lastT) / 1000) : 0.016;
+  lastT = t;
+  const cap = maxR();
+
+  for (const p of pointers.values()) {
+    if (!p.bubble && p.regrab && t > p.start) {
+      p.regrab = false;
+      grabAt(p, p.x, p.y, t);
+    }
+  }
+
+  for (let i = 0; i < bubbles.length; i++) {
+    const b = bubbles[i];
+
+    if (b.held) {
+      const still = t - (b.held.moveT || 0) > 140;
+      if (still) b.held.growT = (b.held.growT || 0) + dt;
+      const hold = b.held.growT || 0;
+      if (still) b.target += (36 + hold * 42) * dt;
+      b.r += (b.target - b.r) * 0.2;
+      if (b.target > cap) b.jiggle = Math.max(b.jiggle, (b.target - cap) / (cap * 0.12));
+    } else {
+      b.r += (b.target - b.r) * 0.1;
+      const left = b.die - t;
+      if (left < 700) b.jiggle = Math.max(b.jiggle, (1 - left / 700) * 0.8);
+      if (left <= 0) b.dead = true;
+
+      const n = Math.sin(b.x * 0.008 + t * 0.0007 + b.phase) * Math.cos(b.y * 0.01 - t * 0.0005);
+      b.vx += n * 0.007 + driftMood * 0.003;
+      b.vy += -0.006 + Math.sin(t * 0.001 + b.phase) * 0.005;
+      b.vx *= 0.99;
+      b.vy *= 0.99;
+      b.x += b.vx;
+      b.y += b.vy;
+
+      if (b.x < b.r) { b.x = b.r; b.vx = Math.abs(b.vx) * 0.6; }
+      if (b.x > w - b.r) { b.x = w - b.r; b.vx = -Math.abs(b.vx) * 0.6; }
+      if (b.y < b.r) { b.y = b.r; b.vy = Math.abs(b.vy) * 0.5; }
+      if (b.y > h - b.r) { b.y = h - b.r; b.vy = -Math.abs(b.vy) * 0.45 - 0.15; }
+    }
+
+    if (b.target > cap * 1.15) b.dead = true;
+    b.jiggle *= 0.94;
+  }
+
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    if (!b.dead) continue;
+    burst(b);
+    if (b.held) {
+      b.held.bubble = null;
+      b.held.start = t + 350;
+      b.held.regrab = true;
+    }
+    bubbles.splice(i, 1);
+  }
+
+  ambientTick++;
+  const ambientLimit = compactView() ? 2 : 7;
+  const ambientInterval = compactView() ? 150 : 60;
+  if (bubbles.length < ambientLimit && ambientTick % ambientInterval === 0) {
+    spawn(w * (0.15 + Math.random() * 0.7), h * (0.7 + Math.random() * 0.25), sizeRoll());
+  }
+
+  for (let i = droplets.length - 1; i >= 0; i--) {
+    const s = droplets[i];
+    s.x += s.vx;
+    s.y += s.vy;
+    s.vy += 0.03;
+    s.vx *= 0.975;
+    s.vy *= 0.975;
+    s.life -= s.decay;
+    if (s.life <= 0) droplets.splice(i, 1);
+  }
+
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    const f = flashes[i];
+    f.r += f.grow;
+    f.grow *= 0.93;
+    f.life -= 0.05;
+    if (f.life <= 0) flashes.splice(i, 1);
+  }
+
+  for (let i = 0; i < dust.length; i++) {
+    const d = dust[i];
+    d.x += d.vx + Math.sin(t * 0.0008 + d.phase) * 0.00005;
+    d.y += d.vy;
+    if (d.y < -0.05) d.y = 1.05;
+    if (d.x < -0.05) d.x = 1.05;
+    if (d.x > 1.05) d.x = -0.05;
+  }
+}
+
+function drawBubble(b, t) {
+  const r = b.r;
+  if (r < 1) return;
+  const squash = b.wob * Math.sin(t * 0.0021 + b.phase) + b.jiggle * 0.1 * Math.sin(t * 0.024 + b.phase);
+  const ang = b.phase + t * 0.0004;
+  const d = r * 2 / FILL;
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.rotate(ang);
+  ctx.scale(1 + squash, 1 - squash);
+  ctx.rotate(-ang);
+  ctx.drawImage(spriteFor(r, b.v), -d / 2, -d / 2, d, d);
+  ctx.restore();
+}
+
+function drawCloudLayer(img, speed, t, dy) {
+  if (!img) return;
+  const off = (t * speed) % w;
+  ctx.drawImage(img, -off, dy, w, h);
+  ctx.drawImage(img, w - off, dy, w, h);
+}
+
+function drawSky(t) {
+  if (painting) ctx.drawImage(painting, 0, 0, w, h);
+  else {
+    ctx.fillStyle = '#7fb0dc';
+    ctx.fillRect(0, 0, w, h);
+  }
+  const warm = 0.55 + 0.45 * Math.sin(t * 0.00004);
+  const sx = w * (0.78 + Math.sin(t * 0.00002) * 0.05);
+  const sy = h * 0.06;
+  const glow = ctx.createRadialGradient(sx, sy, 0, sx, sy, Math.max(w, h, 1) * 0.5);
+  glow.addColorStop(0, `rgba(255,246,222,${0.22 + warm * 0.1})`);
+  glow.addColorStop(0.4, 'rgba(255,238,200,0.06)');
+  glow.addColorStop(1, 'rgba(255,238,200,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, w, h);
+
+  drawCloudLayer(cloudFar, 0.0035, t, 0);
+  drawCloudLayer(cloudNear, 0.009, t, Math.sin(t * 0.00006) * h * 0.008);
+}
+
+function drawGrain() {
+  if (!grain) return;
+  ctx.globalCompositeOperation = 'overlay';
+  ctx.globalAlpha = 0.14;
+  ctx.fillStyle = grain;
+  ctx.fillRect(0, 0, w, h);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function render(t) {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawSky(t);
+
+  const drawDust = (from, to) => {
+    for (let i = from; i < to; i++) {
+      const d = dust[i];
+      if (compactView() && d.kind !== 2 && i % 3) continue;
+      const x = d.x * w;
+      const y = d.y * h;
+      if (d.kind === 1) {
+        const s = d.r * 2 / FILL * 160 / 128;
+        ctx.globalAlpha = d.alpha;
+        ctx.drawImage(bokehSprites[d.v], x - s / 2, y - s / 2, s, s);
+        ctx.globalAlpha = 1;
+      } else if (d.kind === 2) {
+        ctx.globalAlpha = d.alpha * (0.75 + 0.25 * Math.sin(t * 0.002 + d.phase * 3));
+        ctx.drawImage(sparks[d.v], x - d.r, y - d.r, d.r * 2, d.r * 2);
+        ctx.globalAlpha = 1;
+      } else {
+        drawSprite(x, y, d.r, d.alpha, d.v);
+      }
+    }
+  };
+  const front = dust.findIndex(d => d.z > 0.96);
+  const split = front < 0 ? dust.length : front;
+  drawDust(0, split);
+
+  const order = bubbles.slice().sort((a, b) => b.r - a.r);
+  for (let i = 0; i < order.length; i++) drawBubble(order[i], t);
+
+  for (let i = 0; i < flashes.length; i++) {
+    const f = flashes[i];
+    const g = ctx.createRadialGradient(f.x, f.y, f.r * 0.85, f.x, f.y, f.r);
+    g.addColorStop(0, 'rgba(255,255,255,0)');
+    g.addColorStop(0.6, `rgba(255,255,255,${f.life * 0.4})`);
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  for (let i = 0; i < droplets.length; i++) {
+    const s = droplets[i];
+    drawSprite(s.x, s.y, s.size, s.life * 0.8, s.v);
+  }
+
+  drawDust(split, dust.length);
+  drawWand(t);
+  drawGrain();
+}
+
+addEventListener('pointerdown', e => {
+  if (e.cancelable && (e.pointerType === 'mouse' || (actx && actx.state === 'running'))) e.preventDefault();
+  const p = { x: e.clientX, y: e.clientY, start: 0, bubble: null };
+  pointers.set(e.pointerId, p);
+  if (e.pointerType === 'mouse') startAudio();
+  aimWand(p.x, p.y);
+  grabAt(p, p.x, p.y, performance.now());
+}, { passive: false });
+
+addEventListener('pointermove', e => {
+  const p = pointers.get(e.pointerId);
+  if (p || e.pointerType === 'mouse') aimWand(e.clientX, e.clientY);
+  if (!p) return;
+  const moved = Math.hypot(e.clientX - p.x, e.clientY - p.y);
+  if (moved > 1.5) p.moveT = performance.now();
+  p.x = e.clientX;
+  p.y = e.clientY;
+  trail(p, moved);
+});
+
+function endPointer(e) {
+  const p = pointers.get(e.pointerId);
+  if (p && p.bubble) release(p.bubble);
+  pointers.delete(e.pointerId);
+  if (e.pointerType !== 'mouse' && !pointers.size) wand.show = 0;
+}
+document.documentElement.addEventListener('pointerleave', e => {
+  if (e.pointerType === 'mouse') wand.show = 0;
+});
+addEventListener('pointerup', endPointer);
+addEventListener('pointercancel', endPointer);
+addEventListener('contextmenu', e => e.preventDefault());
+addEventListener('selectstart', e => e.preventDefault());
+addEventListener('dragstart', e => e.preventDefault());
+addEventListener('touchstart', e => {
+  if (e.cancelable && actx && actx.state === 'running') e.preventDefault();
+  else unlockAudio();
+}, { passive: false });
+addEventListener('touchend', unlockAudio);
+addEventListener('pointerup', unlockAudio);
+addEventListener('click', unlockAudio);
+addEventListener('keydown', e => {
+  if (e.key === 'm' || e.key === 'M') setMuted(!muted);
+  else unlockAudio();
+});
+document.addEventListener('visibilitychange', () => {
+  if (!actx) return;
+  if (document.hidden) {
+    actx.suspend();
+    if (keepAlive) keepAlive.pause();
+  } else {
+    actx.resume();
+    if (keepAlive) keepAlive.play().catch(() => {});
+  }
+});
+
+function frame(t) {
+  try {
+    if (w > 1 && h > 1) {
+      step(t);
+      stepWand(t);
+      stepAudio(t);
+      render(t);
+    }
+  } catch (err) {
+    if (!frame.seen) { console.error(err); frame.seen = true; }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
